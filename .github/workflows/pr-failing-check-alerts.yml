@@ -1,0 +1,182 @@
+name: PR failing check alerts
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+      - synchronize
+  workflow_job:
+    types:
+      - completed
+  status:
+
+permissions:
+  actions: read
+  checks: read
+  contents: read
+  pull-requests: write
+  statuses: read
+
+jobs:
+  alert-on-failures:
+    if: github.event_name != 'workflow_job' || github.event.workflow_job.workflow_name != 'PR failing check alerts'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update PR alert comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const marker = '<!-- pr-failing-check-alert -->';
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            async function getOpenPullsForSha(sha) {
+              const response = await github.request('GET /repos/{owner}/{repo}/commits/{commit_sha}/pulls', {
+                owner,
+                repo,
+                commit_sha: sha,
+              });
+              return response.data.filter((pr) => pr.state === 'open');
+            }
+
+            function dedupeFailures(items) {
+              const seen = new Set();
+              return items.filter((item) => {
+                const key = `${item.kind}:${item.name}:${item.url || ''}`;
+                if (seen.has(key)) {
+                  return false;
+                }
+                seen.add(key);
+                return true;
+              });
+            }
+
+            let sha;
+            let prs = [];
+            let triggerSummary;
+
+            if (context.eventName === 'pull_request_target') {
+              const pr = context.payload.pull_request;
+              sha = pr.head.sha;
+              prs = [pr];
+              triggerSummary = `PR ${context.payload.action} on #${pr.number}`;
+            } else if (context.eventName === 'workflow_job') {
+              const job = context.payload.workflow_job;
+              sha = job.head_sha;
+              prs = await getOpenPullsForSha(sha);
+              triggerSummary = `Workflow job ${job.name} concluded with ${job.conclusion}`;
+            } else if (context.eventName === 'status') {
+              sha = context.payload.sha;
+              prs = await getOpenPullsForSha(sha);
+              triggerSummary = `Status ${context.payload.context} is ${context.payload.state}`;
+            }
+
+            if (!sha || prs.length === 0) {
+              core.info('No open pull requests matched this event.');
+              return;
+            }
+
+            const failingConclusions = new Set([
+              'action_required',
+              'cancelled',
+              'failure',
+              'stale',
+              'startup_failure',
+              'timed_out',
+            ]);
+
+            const checksResponse = await github.rest.checks.listForRef({
+              owner,
+              repo,
+              ref: sha,
+              filter: 'latest',
+              per_page: 100,
+            });
+
+            const checkFailures = checksResponse.data.check_runs
+              .filter((run) => run.status === 'completed' && failingConclusions.has(run.conclusion))
+              .map((run) => ({
+                kind: 'check',
+                name: run.name,
+                status: run.conclusion,
+                url: run.html_url || run.details_url || '',
+              }));
+
+            const statusResponse = await github.rest.repos.getCombinedStatusForRef({
+              owner,
+              repo,
+              ref: sha,
+            });
+
+            const statusFailures = statusResponse.data.statuses
+              .filter((status) => status.state === 'error' || status.state === 'failure')
+              .map((status) => ({
+                kind: 'status',
+                name: status.context,
+                status: status.state,
+                url: status.target_url || '',
+              }));
+
+            const failures = dedupeFailures([...checkFailures, ...statusFailures]);
+
+            for (const pr of prs) {
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner,
+                repo,
+                issue_number: pr.number,
+                per_page: 100,
+              });
+
+              const existing = comments.find((comment) =>
+                comment.user?.type === 'Bot' && comment.body?.includes(marker)
+              );
+
+              if (failures.length === 0) {
+                if (existing) {
+                  await github.rest.issues.deleteComment({
+                    owner,
+                    repo,
+                    comment_id: existing.id,
+                  });
+                  core.info(`Removed resolved alert comment from PR #${pr.number}.`);
+                }
+                continue;
+              }
+
+              const lines = failures.map((failure) => {
+                const label = failure.kind === 'check' ? 'check' : 'status';
+                const link = failure.url ? ` ([details](${failure.url}))` : '';
+                return `- ${failure.name} (${label}: ${failure.status})${link}`;
+              });
+
+              const body = [
+                marker,
+                '## Failing checks detected',
+                '',
+                `PR #${pr.number} currently has failing checks for commit \`${sha.slice(0, 7)}\`.`,
+                '',
+                ...lines,
+                '',
+                `Triggered by: ${triggerSummary}`,
+                `Updated: ${new Date().toISOString()}`,
+              ].join('\n');
+
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  owner,
+                  repo,
+                  comment_id: existing.id,
+                  body,
+                });
+                core.info(`Updated alert comment on PR #${pr.number}.`);
+              } else {
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: pr.number,
+                  body,
+                });
+                core.info(`Created alert comment on PR #${pr.number}.`);
+              }
+            }
