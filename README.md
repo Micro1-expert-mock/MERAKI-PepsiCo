@@ -12,7 +12,7 @@ This repo captures **scope, decisions, and measurement**, not the full website c
 
 ## Scope
 **Included**
-- Mobile web (iOS and Android)
+- Mobile web (iOS, Android, and Linux)
 - In-scope brand templates
 - Browse → PDP, Store Locator start, Newsletter sign-up
 
